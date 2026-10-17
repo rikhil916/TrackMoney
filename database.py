@@ -29,8 +29,11 @@ DEFAULT_CATEGORIES = [
 class Database:
     """Thin wrapper around a SQLite connection with typed helpers."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, user_id: str = "local") -> None:
         self.path = str(path)
+        # Active owner for personal rows. Cloud auth sets this to the
+        # Supabase user id; logged-out use keeps the legacy "local" scope.
+        self.user_id = user_id
         # check_same_thread=False: Flet may call from a worker thread.
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -66,15 +69,64 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_entries_cat  ON entries(category_id);
             """
         )
+        # Per-user scoping for personal data (cloud accounts). Legacy DBs get
+        # user_id='local' backfilled so existing rows keep working.
+        for table in ("categories", "entries"):
+            cols = [r["name"] for r in
+                    self.conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if "user_id" not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN user_id TEXT NOT NULL DEFAULT 'local'")
+        self.conn.execute(
+            "UPDATE categories SET user_id = 'local' WHERE user_id IS NULL OR user_id = ''")
+        self.conn.execute(
+            "UPDATE entries SET user_id = 'local' WHERE user_id IS NULL OR user_id = ''")
+        self.conn.commit()
+        self._migrate_user_scope()
+
+    def _migrate_user_scope(self) -> None:
+        """Rebuild categories with UNIQUE(user_id, name) (was globally unique).
+
+        Runs once: if the table already has the composite index, skip.
+        """
+        idx = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_categories_user_name'").fetchone()
+        if idx:
+            return
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS categories_new (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                name    TEXT NOT NULL COLLATE NOCASE,
+                color   TEXT NOT NULL,
+                icon    TEXT,
+                user_id TEXT NOT NULL DEFAULT 'local'
+            );
+            INSERT OR IGNORE INTO categories_new (id, name, color, icon, user_id)
+                SELECT id, name, color, icon, COALESCE(user_id, 'local') FROM categories;
+            DROP TABLE categories;
+            ALTER TABLE categories_new RENAME TO categories;
+            CREATE UNIQUE INDEX idx_categories_user_name
+                ON categories (user_id, name COLLATE NOCASE);
+            """
+        )
         self.conn.commit()
 
+    def set_user(self, user_id: str) -> None:
+        """Switch the personal-data scope (login/logout) and seed if needed."""
+        self.user_id = user_id or "local"
+        self._seed_if_empty()
+
     def _seed_if_empty(self) -> None:
-        """Insert starter categories the first time the app runs."""
-        count = self.conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
+        """Insert starter categories for the current user scope only."""
+        count = self.conn.execute(
+            "SELECT COUNT(*) FROM categories WHERE user_id = ?", (self.user_id,)
+        ).fetchone()[0]
         if count == 0:
             self.conn.executemany(
-                "INSERT INTO categories (name, color, icon) VALUES (?, ?, ?)",
-                DEFAULT_CATEGORIES,
+                "INSERT INTO categories (name, color, icon, user_id) VALUES (?, ?, ?, ?)",
+                [(*c, self.user_id) for c in DEFAULT_CATEGORIES],
             )
             self.conn.commit()
 
@@ -84,7 +136,7 @@ class Database:
     # --------------------------------------------------------- categories --
 
     def list_categories(self) -> list[Category]:
-        """All categories with their all-time spent/saved totals."""
+        """Current user's categories with their all-time spent/saved totals."""
         rows = self.conn.execute(
             """
             SELECT c.id, c.name, c.color, c.icon,
@@ -92,9 +144,11 @@ class Database:
                    COALESCE(SUM(CASE WHEN e.type='saved' THEN e.amount END), 0) AS saved
             FROM categories c
             LEFT JOIN entries e ON e.category_id = c.id
+            WHERE c.user_id = ?
             GROUP BY c.id
             ORDER BY c.name COLLATE NOCASE
-            """
+            """,
+            (self.user_id,),
         ).fetchall()
         return [
             Category(
@@ -106,17 +160,17 @@ class Database:
 
     def get_category(self, category_id: int) -> Category | None:
         r = self.conn.execute(
-            "SELECT id, name, color, icon FROM categories WHERE id = ?",
-            (category_id,),
+            "SELECT id, name, color, icon FROM categories WHERE id = ? AND user_id = ?",
+            (category_id, self.user_id),
         ).fetchone()
         if r is None:
             return None
         return Category(id=r["id"], name=r["name"], color=r["color"], icon=r["icon"])
 
     def category_name_exists(self, name: str, exclude_id: int | None = None) -> bool:
-        """Case-insensitive duplicate check used by validation."""
-        q = "SELECT 1 FROM categories WHERE name = ? COLLATE NOCASE"
-        params: list[object] = [name.strip()]
+        """Case-insensitive duplicate check within the current user scope."""
+        q = "SELECT 1 FROM categories WHERE user_id = ? AND name = ? COLLATE NOCASE"
+        params: list[object] = [self.user_id, name.strip()]
         if exclude_id is not None:
             q += " AND id != ?"
             params.append(exclude_id)
@@ -124,16 +178,16 @@ class Database:
 
     def create_category(self, name: str, color: str, icon: str | None) -> int:
         cur = self.conn.execute(
-            "INSERT INTO categories (name, color, icon) VALUES (?, ?, ?)",
-            (name.strip(), color, icon),
+            "INSERT INTO categories (name, color, icon, user_id) VALUES (?, ?, ?, ?)",
+            (name.strip(), color, icon, self.user_id),
         )
         self.conn.commit()
         return int(cur.lastrowid)
 
     def update_category(self, category_id: int, name: str, color: str, icon: str | None) -> None:
         self.conn.execute(
-            "UPDATE categories SET name = ?, color = ?, icon = ? WHERE id = ?",
-            (name.strip(), color, icon, category_id),
+            "UPDATE categories SET name = ?, color = ?, icon = ? WHERE id = ? AND user_id = ?",
+            (name.strip(), color, icon, category_id, self.user_id),
         )
         self.conn.commit()
 
@@ -153,10 +207,13 @@ class Database:
         """
         if delete_entries:
             n = self.count_category_entries(category_id)
-            self.conn.execute("DELETE FROM entries WHERE category_id = ?", (category_id,))
+            self.conn.execute(
+                "DELETE FROM entries WHERE category_id = ? AND user_id = ?",
+                (category_id, self.user_id))
         else:
             n = 0
-        self.conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+        self.conn.execute("DELETE FROM categories WHERE id = ? AND user_id = ?",
+                          (category_id, self.user_id))
         self.conn.commit()
         return n
 
@@ -168,10 +225,10 @@ class Database:
     ) -> int:
         cur = self.conn.execute(
             """
-            INSERT INTO entries (category_id, amount, type, note, entry_date)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO entries (category_id, amount, type, note, entry_date, user_id)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (category_id, amount, type.value, note, entry_date.isoformat()),
+            (category_id, amount, type.value, note, entry_date.isoformat(), self.user_id),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -184,14 +241,16 @@ class Database:
             """
             UPDATE entries
             SET category_id = ?, amount = ?, type = ?, entry_date = ?, note = ?
-            WHERE id = ?
+            WHERE id = ? AND user_id = ?
             """,
-            (category_id, amount, type.value, entry_date.isoformat(), note, entry_id),
+            (category_id, amount, type.value, entry_date.isoformat(), note, entry_id,
+             self.user_id),
         )
         self.conn.commit()
 
     def delete_entry(self, entry_id: int) -> None:
-        self.conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+        self.conn.execute("DELETE FROM entries WHERE id = ? AND user_id = ?",
+                          (entry_id, self.user_id))
         self.conn.commit()
 
     def get_entry(self, entry_id: int) -> Entry | None:
@@ -199,9 +258,9 @@ class Database:
             """
             SELECT e.*, c.name AS cat_name, c.color AS cat_color, c.icon AS cat_icon
             FROM entries e JOIN categories c ON c.id = e.category_id
-            WHERE e.id = ?
+            WHERE e.id = ? AND e.user_id = ?
             """,
-            (entry_id,),
+            (entry_id, self.user_id),
         ).fetchone()
         return self._row_to_entry(r) if r else None
 
@@ -213,9 +272,9 @@ class Database:
         q = """
             SELECT e.*, c.name AS cat_name, c.color AS cat_color, c.icon AS cat_icon
             FROM entries e JOIN categories c ON c.id = e.category_id
-            WHERE 1=1
+            WHERE e.user_id = ?
         """
-        params: list[object] = []
+        params: list[object] = [self.user_id]
         if start is not None:
             q += " AND e.entry_date >= ?"
             params.append(start.isoformat())
@@ -232,15 +291,15 @@ class Database:
     # --------------------------------------------------------- analytics --
 
     def summary(self, start: date, end: date) -> Summary:
-        """Spent/saved totals for an inclusive date range."""
+        """Spent/saved totals for an inclusive date range (current user)."""
         r = self.conn.execute(
             """
             SELECT
                 COALESCE(SUM(CASE WHEN type='spent' THEN amount END), 0) AS spent,
                 COALESCE(SUM(CASE WHEN type='saved' THEN amount END), 0) AS saved
-            FROM entries WHERE entry_date BETWEEN ? AND ?
+            FROM entries WHERE user_id = ? AND entry_date BETWEEN ? AND ?
             """,
-            (start.isoformat(), end.isoformat()),
+            (self.user_id, start.isoformat(), end.isoformat()),
         ).fetchone()
         return Summary(spent=float(r["spent"]), saved=float(r["saved"]))
 
@@ -250,12 +309,12 @@ class Database:
             """
             SELECT c.id, c.name, c.color, c.icon, COALESCE(SUM(e.amount), 0) AS total
             FROM entries e JOIN categories c ON c.id = e.category_id
-            WHERE e.entry_date BETWEEN ? AND ? AND e.type = ?
+            WHERE e.user_id = ? AND e.entry_date BETWEEN ? AND ? AND e.type = ?
             GROUP BY c.id
             HAVING total > 0
             ORDER BY total DESC
             """,
-            (start.isoformat(), end.isoformat(), type.value),
+            (self.user_id, start.isoformat(), end.isoformat(), type.value),
         ).fetchall()
         cats = [
             (Category(id=r["id"], name=r["name"], color=r["color"], icon=r["icon"]),
@@ -271,10 +330,10 @@ class Database:
             SELECT entry_date,
                    COALESCE(SUM(CASE WHEN type='spent' THEN amount END), 0) AS spent,
                    COALESCE(SUM(CASE WHEN type='saved' THEN amount END), 0) AS saved
-            FROM entries WHERE entry_date BETWEEN ? AND ?
+            FROM entries WHERE user_id = ? AND entry_date BETWEEN ? AND ?
             GROUP BY entry_date
             """,
-            (start.isoformat(), end.isoformat()),
+            (self.user_id, start.isoformat(), end.isoformat()),
         ).fetchall()
         by_day = {
             date.fromisoformat(r["entry_date"]): (float(r["spent"]), float(r["saved"]))
